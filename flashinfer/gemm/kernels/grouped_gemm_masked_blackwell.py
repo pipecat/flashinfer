@@ -306,9 +306,17 @@ class MaskedScheduler:
         #     self.params.problem_layout_ncluster_mnl, loc=loc, ip=ip
         # )
         is_swap_ab = self.params.is_swap_ab
-        num_tiles_n = self.params.problem_shape_ntile_mnl[
-            0 if cutlass.const_expr(is_swap_ab) else 1
-        ]
+        n_axis = 0 if cutlass.const_expr(is_swap_ab) else 1
+        m_axis = 1 if cutlass.const_expr(is_swap_ab) else 0
+        # Work indices enumerate clusters; using CTA counts schedules duplicate
+        # tiles for multi-CTA clusters (and can overwrite valid row-scaled output).
+        num_tiles_n = cute.ceil_div(
+            self.params.problem_shape_ntile_mnl[n_axis],
+            self.params.cluster_shape_mn[n_axis],
+        )
+        cluster_tile_m = (
+            self.params.c_tiler[m_axis] * self.params.cluster_shape_mn[m_axis]
+        )
         accum_tile_m = self._accum_tile_m
         batch_idx = self._current_batch_idx
         num_batches = self.params.masked_m.shape[0]
@@ -324,7 +332,7 @@ class MaskedScheduler:
         while keep_running:
             num_tiles_m_cur = cute.ceil_div(
                 self.params.masked_m[batch_idx],
-                self.params.c_tiler[1 if cutlass.const_expr(is_swap_ab) else 0],
+                cluster_tile_m,
             )
             if (accum_tile_m + num_tiles_m_cur) * num_tiles_n <= (
                 current_work_linear_idx
@@ -354,7 +362,7 @@ class MaskedScheduler:
                 accum_tile_m
                 + cute.ceil_div(
                     self.params.masked_m[batch_idx],
-                    self.params.c_tiler[1 if cutlass.const_expr(is_swap_ab) else 0],
+                    cluster_tile_m,
                 )
             ) * num_tiles_n > current_work_linear_idx
 
