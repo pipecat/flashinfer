@@ -1931,6 +1931,8 @@ def scaled_fp4_grouped_quantize(
     a,
     mask,
     a_global_sf,
+    *,
+    per_token_activation: bool = False,
 ):
     r"""Quantize a batched input tensor to NVFP4 with a per-row mask.
 
@@ -1939,9 +1941,17 @@ def scaled_fp4_grouped_quantize(
     a : torch.Tensor
         Input tensor of shape ``[B, M, K]`` with dtype fp16/bf16.
     mask : torch.Tensor
-        Mask tensor applied before quantization.
+        Contiguous int32 tensor of shape ``[B]`` giving each group's valid
+        row count, between zero and ``M``. Values are not checked on the host.
     a_global_sf : torch.Tensor
-        Global scale factor of shape ``[1]`` with dtype ``float32``.
+        Per-expert global encode scales of shape ``[B]``, dtype ``float32``.
+        With ``per_token_activation=True``, instead pass a scalar inverse
+        global scale (typically ``1 / (448 * 6)``), as in :func:`nvfp4_quantize`.
+    per_token_activation : bool
+        Use the CuTe-DSL per-token quantizer and additionally return contiguous
+        FP32 decode scales of shape ``[B, M]``. Multiply these into the GEMM
+        accumulator before converting its output dtype. Masked rows have zero
+        row/block scales and unspecified packed data; they must not be consumed.
 
     Returns
     -------
@@ -1954,8 +1964,69 @@ def scaled_fp4_grouped_quantize(
         ``[32, 4, padded_M // 128, 4, padded_K // 64, B]`` viewed as
         ``float8_e4m3fn``.  ``padded_M`` rounds ``M`` up to a multiple
         of 128 and ``padded_K`` rounds ``K // sf_vec_size`` (with
-        ``sf_vec_size = 16``) up to a multiple of 4.
+        ``sf_vec_size = 16``) up to a multiple of 4. With
+        ``per_token_activation=True``, returns ``(x_q, sf, row_scales)``;
+        ``row_scales`` is contiguous float32 with shape ``[B, M]``.
     """
+    if per_token_activation:
+        from .kernels.nvfp4_quantize import _get_compiled_kernel_nvfp4_per_token
+        from .nvfp4_quantization_utils import (
+            current_nvfp4_4over6_config,
+            env_flag_enabled,
+        )
+
+        if a.ndim != 3 or a.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("Grouped per-token NVFP4 requires 3D fp16/bf16 input")
+        b, m, k = a.shape
+        if not a.is_cuda or k == 0 or k % 16:
+            raise ValueError(
+                "Grouped per-token NVFP4 requires CUDA input and K divisible by 16"
+            )
+        if (
+            mask.shape != (b,)
+            or mask.dtype != torch.int32
+            or mask.device != a.device
+            or not mask.is_contiguous()
+        ):
+            raise ValueError(
+                "mask must be a contiguous int32 [B] tensor on the input device"
+            )
+        scale_inv = torch.as_tensor(a_global_sf, dtype=torch.float32, device=a.device)
+        if scale_inv.numel() != 1:
+            raise ValueError(
+                "Per-token a_global_sf must be a scalar inverse global scale"
+            )
+        scale_inv = scale_inv.reshape(1).contiguous()
+        padded_m, padded_k = round_up(m, 128), round_up(k // 16, 4)
+        output = torch.empty((b, m, k // 2), dtype=torch.uint8, device=a.device)
+        scales = torch.zeros(
+            (b, padded_m * padded_k), dtype=torch.uint8, device=a.device
+        )
+        row_scales = torch.empty((b, m), dtype=torch.float32, device=a.device)
+        if b and m:
+            kernel = _get_compiled_kernel_nvfp4_per_token(
+                "bfloat16" if a.dtype == torch.bfloat16 else "float16",
+                k,
+                disable_fp4_quant_fast_math=env_flag_enabled(
+                    "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"
+                ),
+                nvfp4_4over6_config=current_nvfp4_4over6_config(),
+                grouped=True,
+            )
+            kernel(
+                a.contiguous().view(b * m, k),
+                output.view(b * m, k // 2),
+                scales.view(-1),
+                row_scales.view(-1),
+                m,
+                scale_inv,
+                mask,
+            )
+        sf = scales.view(torch.float8_e4m3fn).view(
+            b, padded_m // 128, padded_k // 4, 32, 4, 4
+        )
+        return output.permute(1, 2, 0), sf.permute(3, 4, 1, 5, 2, 0), row_scales
+
     major, minor = get_compute_capability(a.device)
     device_arch = f"{major * 10 + minor}"
     a_fp4, a_sf = get_fp4_quantization_module(
