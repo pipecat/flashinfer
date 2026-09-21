@@ -306,9 +306,17 @@ class MaskedScheduler:
         #     self.params.problem_layout_ncluster_mnl, loc=loc, ip=ip
         # )
         is_swap_ab = self.params.is_swap_ab
-        num_tiles_n = self.params.problem_shape_ntile_mnl[
-            0 if cutlass.const_expr(is_swap_ab) else 1
-        ]
+        n_axis = 0 if cutlass.const_expr(is_swap_ab) else 1
+        m_axis = 1 if cutlass.const_expr(is_swap_ab) else 0
+        # Work indices enumerate clusters; using CTA counts schedules duplicate
+        # tiles for multi-CTA clusters (and can overwrite valid row-scaled output).
+        num_tiles_n = cute.ceil_div(
+            self.params.problem_shape_ntile_mnl[n_axis],
+            self.params.cluster_shape_mn[n_axis],
+        )
+        cluster_tile_m = (
+            self.params.c_tiler[m_axis] * self.params.cluster_shape_mn[m_axis]
+        )
         accum_tile_m = self._accum_tile_m
         batch_idx = self._current_batch_idx
         num_batches = self.params.masked_m.shape[0]
@@ -324,7 +332,7 @@ class MaskedScheduler:
         while keep_running:
             num_tiles_m_cur = cute.ceil_div(
                 self.params.masked_m[batch_idx],
-                self.params.c_tiler[1 if cutlass.const_expr(is_swap_ab) else 0],
+                cluster_tile_m,
             )
             if (accum_tile_m + num_tiles_m_cur) * num_tiles_n <= (
                 current_work_linear_idx
@@ -354,7 +362,7 @@ class MaskedScheduler:
                 accum_tile_m
                 + cute.ceil_div(
                     self.params.masked_m[batch_idx],
-                    self.params.c_tiler[1 if cutlass.const_expr(is_swap_ab) else 0],
+                    cluster_tile_m,
                 )
             ) * num_tiles_n > current_work_linear_idx
 
@@ -867,6 +875,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         barrier_flag_multicast: Optional[cute.Pointer],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
+        a_per_token_scale: Optional[cute.Tensor] = None,
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -1119,6 +1128,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             tma_atom_c,
             c_tensor if self.is_combine_fusion else tma_tensor_c,
             alpha_tensor,
+            a_per_token_scale,
             topk_weights,
             idx_src_info,
             rank_src_info,
@@ -1161,6 +1171,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         tma_atom_c: Optional[cute.CopyAtom],
         mC_mnl: cute.Tensor,
         alpha: Optional[cute.Tensor],
+        a_per_token_scale: Optional[cute.Tensor],
         topk_weights: Optional[cute.Tensor],
         idx_src_info: Optional[cute.Tensor],
         rank_src_info: Optional[cute.Tensor],
@@ -1816,6 +1827,20 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 )
             )
 
+            if cutlass.const_expr(a_per_token_scale is not None and self.is_swap_ab):
+                # Match row coordinates to the retiled accumulator fragment, including
+                # the transposed (swap-AB) epilogue. No work in the unscaled specialization.
+                epi_coords = cute.make_identity_tensor(
+                    (cute.size(epi_tile[0]), cute.size(epi_tile[1]))
+                )
+                tTR_coords = tiled_copy_t2r.get_slice(epi_tidx).partition_D(epi_coords)
+                tRS_coords = tiled_copy_r2s.retile(tTR_coords)
+                row_scale_frag = cute.make_rmem_tensor(tRS_rC.shape, cutlass.Float32)
+                epi_subtiles = (
+                    cute.size(tTR_tAcc_base.shape[3]),
+                    cute.size(tTR_tAcc_base.shape[4]),
+                )
+
             # S2R copy for topk_weights: SMEM → registers with T2R-compatible layout
             if cutlass.const_expr(self.is_combine_fusion):
                 topk_s2r_atom = cute.make_copy_atom(
@@ -1866,6 +1891,20 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     cur_tile_coord[1],
                     cur_tile_coord[2],
                 )
+
+                if cutlass.const_expr(
+                    a_per_token_scale is not None and not self.is_swap_ab
+                ):
+                    # As in the contiguous per-token MoE GEMM, each epilogue
+                    # thread owns one row. Reuse its decode scale across N subtiles.
+                    token_row = (
+                        cur_tile_coord[0] * self.cta_tile_shape_mnk[0] + epi_tidx
+                    )
+                    row_decode_scale = cutlass.Float32(0.0)
+                    if token_row < tile_sched_params.masked_m[cur_tile_coord[2]]:
+                        row_decode_scale = a_per_token_scale[
+                            cur_tile_coord[2], token_row
+                        ]
 
                 #
                 # Slice to per mma tile index
@@ -1966,6 +2005,28 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                     if cutlass.const_expr(alpha is not None):
                         acc_vec = acc_vec * alpha[work_tile.tile_idx[2]]
+
+                    if cutlass.const_expr(a_per_token_scale is not None):
+                        if cutlass.const_expr(self.is_swap_ab):
+                            subtile_mn = cute.idx2crd(subtile_idx, epi_subtiles)
+                            for i in cutlass.range_constexpr(cute.size(row_scale_frag)):
+                                row = (
+                                    cur_tile_dim1_offset
+                                    + subtile_mn[1] * cute.size(epi_tile[1])
+                                    + tRS_coords[i][1]
+                                )
+                                scale = cutlass.Float32(0.0)
+                                if (
+                                    row
+                                    < tile_sched_params.masked_m[work_tile.tile_idx[2]]
+                                ):
+                                    scale = a_per_token_scale[
+                                        work_tile.tile_idx[2], row
+                                    ]
+                                row_scale_frag[i] = scale
+                            acc_vec = acc_vec * row_scale_frag.load()
+                        else:
+                            acc_vec = acc_vec * row_decode_scale
 
                     if cutlass.const_expr(self.is_combine_fusion):
                         acc_vec = acc_vec * topk_regs_mn
@@ -3000,6 +3061,7 @@ class MaskedBatchedMatmulCuteDSL:
         barrier_flag_local_ptr: Optional[cute.Pointer],
         barrier_flag_multicast_ptr: Optional[cute.Pointer],
         current_stream: cuda.CUstream,
+        a_per_token_scale_ptr: Optional[cute.Pointer] = None,
     ):
         a_tensor = cute.make_tensor(
             a_ptr,
@@ -3128,6 +3190,16 @@ class MaskedBatchedMatmulCuteDSL:
             else None
         )
 
+        row_count = self._n if self._is_swap_ab else self._m
+        a_per_token_scale = (
+            cute.make_tensor(
+                a_per_token_scale_ptr,
+                cute.make_layout((self._l, row_count), stride=(row_count, 1)),
+            )
+            if cutlass.const_expr(a_per_token_scale_ptr is not None)
+            else None
+        )
+
         Sm100BlockScaledPersistentDenseGemmKernel(
             sf_vec_size=self._sf_vec_size,
             mma_tiler_mn=self._mma_tiler_mn,
@@ -3153,6 +3225,7 @@ class MaskedBatchedMatmulCuteDSL:
             barrier_flag_multicast_tensor,
             self._max_active_clusters,
             current_stream,
+            a_per_token_scale,
         )
 
 
@@ -3179,6 +3252,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
     enable_barrier_flag: bool = False,
     is_combine_fusion: bool = False,
     is_swap_ab: bool = False,
+    use_a_per_token_scale: bool = False,
 ) -> Callable:
     def get_cute_pointers(
         input_tensors: Optional[List[torch.tensor]],
@@ -3422,6 +3496,16 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             barrier_flag_multicast_ptr,
         ]
 
+    def get_row_scale_ptr(tensor=None):
+        if not use_a_per_token_scale:
+            return None
+        return make_ptr(
+            cutlass.Float32,
+            16 if tensor is None else tensor.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        )
+
     kernel = cute.compile(
         MaskedBatchedMatmulCuteDSL(
             m=m,
@@ -3446,6 +3530,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
         ),
         *get_cute_pointers(None),
         cutlass_torch.current_stream(),
+        get_row_scale_ptr(),
     )
 
     def tensor_api(
@@ -3463,6 +3548,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
         out_ptrs_tensor_gpu: Optional[torch.Tensor] = None,
         barrier_flag_local_tensor_gpu: Optional[torch.Tensor] = None,
         barrier_flag_multicast_tensor_gpu: Optional[torch.Tensor] = None,
+        a_per_token_scale_tensor: Optional[torch.Tensor] = None,
     ):
         if c_tensor_gpu is None:
             # fp4 gemm output is not supported
@@ -3496,6 +3582,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 ]
             ),
             current_stream,
+            get_row_scale_ptr(a_per_token_scale_tensor),
         )
 
         return c_tensor_gpu
@@ -3513,6 +3600,7 @@ def _grouped_gemm_nt_masked_sm100(
     sf_dtype: str,
     c_dtype: str,
     sf_vec_size: int,
+    a_per_token_scale: Optional[torch.Tensor] = None,
     topk_weights: Optional[torch.Tensor] = None,
     idx_src_info: Optional[torch.Tensor] = None,
     rank_src_info: Optional[torch.Tensor] = None,
@@ -3533,7 +3621,9 @@ def _grouped_gemm_nt_masked_sm100(
     from ``grouped_gemm_masked_wrapper`` as the public entry point.
 
     Executes a masked, batched matrix multiplication with scale factors and
-    optional per-batch alpha scaling on the output.  ``alpha`` is currently
+    optional per-batch alpha scaling on the output. ``a_per_token_scale`` is
+    an optional contiguous float32 ``[l, m]`` tensor of input row decode scales,
+    multiplied with alpha in FP32 before output conversion.  ``alpha`` is currently
     applied internally by the kernel; see Notes for the canonical tensor
     layouts.
 
@@ -3671,6 +3761,16 @@ def _grouped_gemm_nt_masked_sm100(
             )
 
     m, k, l = a_torch.shape
+    if a_per_token_scale is not None:
+        if (
+            a_per_token_scale.shape != (l, lhs[0].shape[0])
+            or a_per_token_scale.dtype != torch.float32
+            or a_per_token_scale.device != a_torch.device
+            or not a_per_token_scale.is_contiguous()
+        ):
+            raise ValueError(
+                "a_per_token_scale must be contiguous float32 [l, m] on the input device"
+            )
     n, _, _ = b_torch.shape
 
     if ab_dtype == "float4_e2m1fn":
@@ -3737,6 +3837,7 @@ def _grouped_gemm_nt_masked_sm100(
         enable_barrier_flag=barrier_flag_local is not None,
         is_combine_fusion=is_combine_fusion,
         is_swap_ab=is_swap_ab,
+        use_a_per_token_scale=a_per_token_scale is not None,
     )(
         a_tensor_gpu=a_torch,
         b_tensor_gpu=b_torch,
@@ -3746,6 +3847,7 @@ def _grouped_gemm_nt_masked_sm100(
         masked_m_tensor_gpu=masked_m,
         dst_signals_tensor_gpu=dst_signals,
         alpha_tensor_gpu=alpha,
+        a_per_token_scale_tensor=a_per_token_scale,
         topk_weights_tensor_gpu=topk_weights,
         idx_src_info_tensor_gpu=idx_src_info,
         rank_src_info_tensor_gpu=rank_src_info,

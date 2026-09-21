@@ -1747,6 +1747,7 @@ def _grouped_gemm_nt_masked_reference(
     sf_dtype: str = "ue4m3",
     c_dtype: str = "bf16",
     sf_vec_size: int = 128,
+    a_per_token_scale=None,
     **_unused,
 ):
     """Reference for grouped_gemm_nt_masked: per-group masked GEMM where
@@ -1767,7 +1768,10 @@ def _grouped_gemm_nt_masked_reference(
             continue
         a = lhs_data[g, :m].to(torch.float32)
         b = rhs_data[g].to(torch.float32)
-        out[g, :m] = (a @ b.T).to(out.dtype)
+        result = a @ b.T
+        if a_per_token_scale is not None:
+            result *= a_per_token_scale[g, :m, None]
+        out[g, :m] = result.to(out.dtype)
     return out
 
 
@@ -1847,6 +1851,12 @@ grouped_gemm_nt_masked_trace = TraceTemplate(
             ["num_groups"],
             dtype="int32",
             description="Per-group valid row count.",
+        ),
+        "a_per_token_scale": Tensor(
+            ["num_groups", "max_m"],
+            dtype="float32",
+            optional=True,
+            description="Input row decode scales, applied before output conversion.",
         ),
         "ab_dtype": Scalar("int32"),
         "sf_dtype": Scalar("int32"),
