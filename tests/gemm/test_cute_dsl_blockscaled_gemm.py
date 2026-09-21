@@ -420,3 +420,100 @@ if __name__ == "__main__":
         sm_count=132,
         enable_dst_signals=True,
     )
+
+
+@pytest.mark.parametrize(
+    "swap_ab,tile_m,cluster,m",
+    [
+        (False, 128, (1, 1), 129),
+        (True, 128, (1, 1), 136),
+        (False, 256, (2, 1), 129),
+        (False, 256, (2, 1), 513),
+        (False, 128, (1, 2), 129),
+    ],
+)
+@pytest.mark.parametrize("with_alpha", [False, True])
+@pytest.mark.parametrize("with_row_scale", [False, True])
+@torch.inference_mode()
+def test_masked_gemm_per_token_scale(
+    swap_ab, tile_m, cluster, m, with_alpha, with_row_scale
+):
+    """Row scales follow the accumulator layout and precede BF16 conversion."""
+    from flashinfer import scaled_fp4_grouped_quantize
+    from tests.test_helpers.utils_fp4 import cast_from_fp4
+    from tests.utils.test_fp4_quantize import unswizzle_sf
+
+    if torch.cuda.get_device_capability() not in [(10, 0), (10, 3)]:
+        pytest.skip("Requires Blackwell")
+    torch.manual_seed(42)
+    e, n, k = 3, 256, 256
+    mask = torch.tensor([m, 65, 0], device="cuda", dtype=torch.int32)
+    inverse = torch.tensor([1 / (448 * 6)], device="cuda")
+    a = torch.randn(e, m, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(e, n, k, device="cuda", dtype=torch.bfloat16)
+    aq, sa, rows = scaled_fp4_grouped_quantize(
+        a, mask, inverse, per_token_activation=True
+    )
+    bq, sb, _ = scaled_fp4_grouped_quantize(
+        b,
+        torch.full((e,), n, device="cuda", dtype=torch.int32),
+        inverse,
+        per_token_activation=True,
+    )
+    rows.copy_(torch.logspace(-4, 1, e * m, device="cuda").view(e, m))
+    rows[0, 0] = 0
+    alpha = torch.tensor([0.75, -1.25, 2], device="cuda") if with_alpha else None
+    out = (
+        torch.empty(e, m, n, device="cuda", dtype=torch.bfloat16).permute(2, 1, 0)
+        if swap_ab
+        else torch.empty(e, m, n, device="cuda", dtype=torch.bfloat16).permute(1, 2, 0)
+    )
+
+    def run():
+        grouped_gemm_nt_masked(
+            (aq, sa),
+            (bq, sb),
+            out,
+            mask,
+            ab_dtype="float4_e2m1fn",
+            sf_dtype="float8_e4m3fn",
+            c_dtype="bfloat16",
+            sf_vec_size=16,
+            alpha=alpha,
+            alpha_dtype="float32",
+            a_per_token_scale=rows if with_row_scale else None,
+            is_swap_ab=swap_ab,
+            mma_tiler_mn=(tile_m, 128),
+            cluster_shape_mn=cluster,
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for counts in ([m, 65, 0], [1, 0, 0]):
+        mask.copy_(torch.tensor(counts, device="cuda", dtype=torch.int32))
+        rows.mul_(0.5)
+        graph.replay()
+        for g, count in enumerate(counts):
+            if count == 0:
+                continue
+            a_sf = unswizzle_sf(sa.permute(5, 2, 4, 0, 1, 3)[g], m, k)
+            b_sf = unswizzle_sf(sb.permute(5, 2, 4, 0, 1, 3)[g], n, k)
+            ad = cast_from_fp4(
+                aq[:, :, g].contiguous()
+            ).float() * a_sf.float().repeat_interleave(16, -1)
+            bd = cast_from_fp4(
+                bq[:, :, g].contiguous()
+            ).float() * b_sf.float().repeat_interleave(16, -1)
+            ref = ad[:count] @ bd.T
+            if alpha is not None:
+                ref *= alpha[g]
+            if with_row_scale:
+                ref *= rows[g, :count, None]
+            torch.testing.assert_close(
+                out[:, :count, g].T if swap_ab else out[:count, :, g],
+                ref.bfloat16(),
+                rtol=0.016,
+                atol=0.25,
+            )
