@@ -452,20 +452,6 @@ full policy is [`flashinfer/experimental/README.md`](flashinfer/experimental/REA
 
 ## Key Architectural Patterns
 
-### Masked grouped per-token NVFP4
-
-`scaled_fp4_grouped_quantize(..., per_token_activation=True)` returns packed
-NVFP4, grouped block scales, and FP32 `[experts, rows]` decode scales. Pass
-the latter as `a_per_token_scale` to `grouped_gemm_nt_masked` on SM100/SM103;
-row scales multiply FP32 accumulators before output conversion. The optional
-per-expert `alpha` still supplies weight decode scaling. Masks contain valid
-row counts, and masked packed bytes are unspecified.
-
-`benchmarks/bench_grouped_nvfp4_per_token.py` compares the grouped path with
-per-expert CUDA/CuTe-DSL per-token quantization and grouped non-per-token
-quantization, including layout packing, reconstruction error, and optional
-GEMM timings. Use `--quant-only` on GPUs without the SM100 GEMM backend.
-
 ### Module Caching
 
 FlashInfer uses two-level caching to avoid recompilation:
