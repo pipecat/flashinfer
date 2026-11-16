@@ -21,11 +21,8 @@ The contiguous-grouped implementation is exposed through the Python API
 - EP: `num_local_experts` + `local_expert_offset` select the local expert
   shard (tokens routed entirely outside it contribute zeros). TP is
   shape-only (callers pass per-rank weight shards).
-- Shapes: `hidden % 64 == 0` (GEMM1's reduction moves whole 64-element K
-  tiles); gated activations need `I % 32 == 0` (interleave granularity,
-  GEMM1 walks `2I` in 64-column tiles), ReLU² needs `I % 64 == 0` (GEMM1
-  walks `I` in the same tiles); GEMM2's K tail is zero-filled by TMA;
-  `num_tokens == 0` supported.
+- Shapes: `hidden % 8 == 0`; `I % 32 == 0` for gated activations (32-column
+  up/gate interleave), `I % 8 == 0` for ReLU²; `num_tokens == 0` supported.
 - Execution: CUDA-graph capturable; PDL on by default (`enable_pdl`);
   fused finalize (default) is atomic and not bitwise-reproducible,
   `use_fused_finalize=False` selects the deterministic two-stage path.
@@ -196,10 +193,13 @@ shapes and the global expert count; the local shard enters only through
 the padded row bound, so expert-parallel ranks that tune together profile
 identical sequences.
 
-Compiled kernels are reused within a process. Loading saved tuning results
-still requires compiling the selected kernels, so applications must warm
-relevant shapes and tactics before CUDA-graph capture or latency-sensitive
-serving.
+Each GEMM specialization (dtype, tactic, `top_k`, PDL, activation
+constants, resident cluster count) is compiled once per process as a
+TVM-FFI function, so a launch passes raw device addresses, dimensions and
+the stream handle without per-call pointer objects or argument
+marshalling. Loading saved tuning results still requires compiling the
+selected kernels, so applications must warm relevant shapes and tactics
+before CUDA-graph capture or latency-sensitive serving.
 
 ## 6. Weight layout and Python API
 
