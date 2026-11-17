@@ -440,7 +440,7 @@ def test_masked_gemm_per_token_scale(
 ):
     """Row scales follow the accumulator layout and precede BF16 conversion."""
     from flashinfer import scaled_fp4_grouped_quantize
-    from tests.test_helpers.utils_fp4 import cast_from_fp4
+    from tests.quantization.test_helpers.utils_fp4 import cast_from_fp4
     from tests.utils.test_fp4_quantize import unswizzle_sf
 
     if torch.cuda.get_device_capability() not in [(10, 0), (10, 3)]:

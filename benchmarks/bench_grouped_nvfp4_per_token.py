@@ -24,6 +24,9 @@ and GEMM error against FP32 inputs. Weight quantization and calibration are
 outside timing for every path. GEMM requires SM100/SM103; quantization can be
 measured separately on SM12x. Default timing uses warm-L2 CUDA graphs; CUPTI
 is selectable. Existing FLASHINFER_NVFP4_* settings are recorded in JSON.
+Per-stage overhead is (grouped_per_token / grouped_non_per_token - 1) * 100.
+The default 5% target is descriptive, not a correctness assertion. The combined
+measurement covers activation quantization plus one GEMM, not a full MoE layer.
 
 Example:
     python benchmarks/bench_grouped_nvfp4_per_token.py --output results.json
@@ -167,6 +170,7 @@ def benchmark_case(args, e, m, k, n):
             "median_us": statistics.median(times) * 1000,
             "min_us": min(times) * 1000,
             "max_us": max(times) * 1000,
+            "samples_us": [t * 1000 for t in times],
         }
 
     gemm_enabled = not args.quant_only and torch.cuda.get_device_capability() in (
@@ -249,11 +253,28 @@ def benchmark_case(args, e, m, k, n):
             metrics["gemm"] = time_us(lambda: gemm(result))
             metrics["quantization_and_gemm"] = time_us(lambda: gemm(fn()))
         results[name] = metrics
+    # Compare public-call costs with the original grouped path on identical inputs.
+    # Measure the combined call directly; adding isolated timings misses cache effects.
+    overhead = {}
+    for stage in ("quantization", "gemm", "quantization_and_gemm"):
+        if stage not in results["grouped_non_per_token"]:
+            continue
+        baseline = results["grouped_non_per_token"][stage]["median_us"]
+        enabled = results["grouped_per_token"][stage]["median_us"]
+        percent = (enabled / baseline - 1) * 100
+        overhead[stage] = {
+            "baseline_us": baseline,
+            "per_token_us": enabled,
+            "delta_us": enabled - baseline,
+            "overhead_percent": percent,
+            "within_target": percent <= args.overhead_target,
+        }
     return {
         "shape": {"experts": e, "m": m, "k": k, "n": n},
         "valid_rows": counts,
         "gemm_enabled": gemm_enabled,
         "paths": results,
+        "per_token_overhead": overhead,
     }
 
 
@@ -270,6 +291,12 @@ def main():
     parser.add_argument("--quant-only", action="store_true")
     parser.add_argument("--cupti", action="store_true")
     parser.add_argument("--repeat", type=int, default=30)
+    parser.add_argument(
+        "--overhead-target",
+        type=float,
+        default=5.0,
+        help="Report whether each stage meets this overhead percentage (not a test gate)",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     import importlib.metadata
