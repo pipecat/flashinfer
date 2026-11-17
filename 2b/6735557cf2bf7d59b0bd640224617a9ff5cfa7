@@ -1,0 +1,23 @@
+benchmarks/bench_grouped_nvfp4_per_token.py
+  s_db6fddc6dc986e::t_8d7f35a4d9ad45 27-29,173
+  s_db6fddc6dc986e::t_4a94dc97affd0d 256-271,277,294,298-299
+  s_db6fddc6dc986e::t_e56ec099cf9406 295-297
+tests/gemm/test_cute_dsl_blockscaled_gemm.py
+  s_db6fddc6dc986e::t_d6e25c133579f0 443
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2b6735557cf2bf7d59b0bd640224617a9ff5cfa7",
+  "prompts": {},
+  "sessions": {
+    "s_db6fddc6dc986e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c3e3-5f80-7b00-b927-cd75e6275d7c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "潜雨 <runyuan.zry@antgroup.com>"
+    }
+  }
+}
