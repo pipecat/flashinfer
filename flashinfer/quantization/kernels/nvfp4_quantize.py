@@ -907,6 +907,7 @@ class NVFP4QuantizePerTokenKernel:
         threads: int | None = None,
         rows_per_group: int = 0,
         sf_rows_per_group: int = 0,
+        grouped_counts: bool = False,
     ):
         self.dtype = dtype
         self.K = K
@@ -918,6 +919,7 @@ class NVFP4QuantizePerTokenKernel:
         self.sf_layout = sf_layout
         self.rows_per_group = rows_per_group
         self.sf_rows_per_group = sf_rows_per_group
+        self.grouped_counts = grouped_counts
         self.sf_is_128x4 = sf_layout == SF_LAYOUT_128x4
         self.sf_is_8x4 = sf_layout == SF_LAYOUT_8x4
 
@@ -1085,19 +1087,52 @@ class NVFP4QuantizePerTokenKernel:
         grid_stride, _, _ = cute.arch.grid_dim()
         for row_idx in cutlass.range(bidx, padded_M, grid_stride):
             row_is_valid = row_idx < M
-            if cutlass.const_expr(mRowLimits is not None):
+            if cutlass.const_expr(self.grouped_counts):
+                group = row_idx // self.rows_per_group
+                local_row = row_idx % self.rows_per_group
+                count = cutlass.min(
+                    cutlass.max(mRowLimits[group], 0), self.rows_per_group
+                )
+                row_is_valid = local_row < count
+                # A 128x4 SF atom stores four bytes per row. Clear masked and
+                # padding rows in physical word order, sharing the final tiles
+                # across the group's CTAs even when few tokens were routed here.
+                scale_words = cute.recast_tensor(mScales, cutlass.Uint32)
+                words_per_tile = 128 * (self.padded_sf_cols // 4)
+                words_per_group = self.sf_rows_per_group * (self.padded_sf_cols // 4)
+                word = (
+                    Int64(count // 128) * words_per_tile
+                    + Int64(local_row) * self.threads
+                    + tidx
+                )
+                while word < words_per_group:
+                    sf_row = (
+                        (word // words_per_tile) * 128
+                        + (word % 128) // 4
+                        + (word % 4) * 32
+                    )
+                    if sf_row >= count:
+                        scale_words[Int64(group) * words_per_group + word] = (
+                            cutlass.Uint32(0)
+                        )
+                    word += self.rows_per_group * self.threads
+                if not row_is_valid:
+                    if tidx == 0:
+                        mPerTokenScale[row_idx] = Float32(0)
+            elif cutlass.const_expr(mRowLimits is not None):
                 if row_is_valid:
                     row_is_valid = row_idx < mRowLimits[row_idx // self.rows_per_group]
             if not row_is_valid:
                 # Inactive rows can be inside the live prefix. Define their
                 # SF slots in every layout; rounded MMA lanes may read them.
-                sf_col_idx = tidx
-                while sf_col_idx < padded_sf_cols:
-                    sf_offset = self._compute_sf_offset(
-                        row_idx, sf_col_idx, padded_sf_cols
-                    )
-                    mScales[sf_offset] = Uint8(0)
-                    sf_col_idx = sf_col_idx + threads
+                if cutlass.const_expr(not self.grouped_counts):
+                    sf_col_idx = tidx
+                    while sf_col_idx < padded_sf_cols:
+                        sf_offset = self._compute_sf_offset(
+                            row_idx, sf_col_idx, padded_sf_cols
+                        )
+                        mScales[sf_offset] = Uint8(0)
+                        sf_col_idx = sf_col_idx + threads
             elif cutlass.const_expr(self.register_resident):
                 self._quantize_row_register_resident(
                     mInput,
@@ -2377,6 +2412,7 @@ def _get_compiled_kernel_nvfp4_per_token(
     has_valid_rows: bool = False,
     rows_per_group: int = 0,
     sf_rows_per_group: int = 0,
+    grouped_counts: bool = False,
 ) -> Callable:
     _dtype_map = {
         "float16": cutlass.Float16,
@@ -2429,12 +2465,13 @@ def _get_compiled_kernel_nvfp4_per_token(
         threads=threads,
         rows_per_group=rows_per_group,
         sf_rows_per_group=sf_rows_per_group,
+        grouped_counts=grouped_counts,
     )
 
     return build_and_load_cute_dsl_kernel(
         _CUTE_DSL_MODULE,
         _nvfp4_kernel_name(
-            "per_token",
+            "per_token_counts" if grouped_counts else "per_token",
             dtype_key,
             K,
             sf_layout,

@@ -52,6 +52,7 @@ def grouped_gemm_nt_masked(
     sf_dtype: str,
     c_dtype: str,
     sf_vec_size: int,
+    a_per_token_scale: Optional[torch.Tensor] = None,
     topk_weights: Optional[torch.Tensor] = None,
     idx_src_info: Optional[torch.Tensor] = None,
     rank_src_info: Optional[torch.Tensor] = None,
@@ -106,6 +107,10 @@ def grouped_gemm_nt_masked(
         ``"bfloat16"``, ``"float32"``, ``"float8_e4m3fn"``, ``"float8_e5m2"``.
     sf_vec_size : int
         Vector size for scale factors (typically 16 or 32).
+    a_per_token_scale : Optional[torch.Tensor]
+        Contiguous float32 tensor of shape ``(l, m)`` containing input row
+        decode scales, applied in FP32 before output conversion. Supported
+        on SM100/SM103 only. Defaults to ``None``.
     topk_weights : Optional[torch.Tensor]
         2-D ``float32`` tensor of shape ``(l, m)`` containing top-k routing
         weights.  Defaults to ``None``.
@@ -218,6 +223,7 @@ def grouped_gemm_nt_masked(
         unsupported = [
             name
             for name, value, default in (
+                ("a_per_token_scale", a_per_token_scale, None),
                 ("topk_weights", topk_weights, None),
                 ("idx_src_info", idx_src_info, None),
                 ("rank_src_info", rank_src_info, None),
@@ -271,6 +277,7 @@ def grouped_gemm_nt_masked(
             sf_dtype=sf_dtype,
             c_dtype=c_dtype,
             sf_vec_size=sf_vec_size,
+            a_per_token_scale=a_per_token_scale,
             topk_weights=topk_weights,
             idx_src_info=idx_src_info,
             rank_src_info=rank_src_info,

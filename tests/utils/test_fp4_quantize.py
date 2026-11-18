@@ -2816,3 +2816,131 @@ def test_nvfp4_quantize_pdl_waits_for_global_scale(dtype, shape):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("m,k", [(5, 80), (129, 4096)])
+@pytest.mark.parametrize("reference_backend", ["cuda", "cute-dsl"])
+@pytest.mark.parametrize("nvfp4_4over6_config", NVFP4_DEFAULT_4OVER6_CONFIGS)
+@pytest.mark.parametrize("recipe_source", ["env", "argument"])
+@torch.inference_mode()
+def test_grouped_per_token_nvfp4(
+    dtype,
+    m,
+    k,
+    reference_backend,
+    nvfp4_4over6_config,
+    recipe_source,
+    set_nvfp4_quant_env,
+):
+    """Match the existing per-token kernel, including masked/padded expert rows."""
+    if not _is_fp4_supported(torch.device("cuda")):
+        pytest.skip("Requires Blackwell")
+    if not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+    set_nvfp4_quant_env(nvfp4_4over6_config=nvfp4_4over6_config)
+    recipe_kwargs = {}
+    if recipe_source == "argument":
+        recipe_kwargs["nvfp4_4over6"] = resolve_nvfp4_4over6(nvfp4_4over6_config)
+        # Explicit recipes, including None, must override the opposite environment.
+        set_nvfp4_quant_env(
+            nvfp4_4over6_config=(
+                NVFP4_DEFAULT_4OVER6_CONFIGS[1] if nvfp4_4over6_config is None else None
+            )
+        )
+    torch.manual_seed(42)
+    x = torch.randn(3, m, k, device="cuda", dtype=dtype)
+    x *= torch.logspace(-3, 3, m, device="cuda").view(1, m, 1)
+    x[0, 0] = 0
+    mask = torch.tensor([m, m - 2, 0], device="cuda", dtype=torch.int32)
+    scale_inv = torch.tensor([1 / (448 * 6)], device="cuda")
+    # Masked rows can be uninitialized DeepEP receive-buffer contents.
+    for e, count in enumerate(mask.tolist()):
+        x[e, count:] = float("nan")
+    scaled_fp4_grouped_quantize(
+        x, mask, scale_inv, per_token_activation=True, **recipe_kwargs
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        q, sf, rows = scaled_fp4_grouped_quantize(
+            x, mask, scale_inv, per_token_activation=True, **recipe_kwargs
+        )
+    for counts in ([m, m - 2, 0], [1, 0, 0]):
+        mask.copy_(torch.tensor(counts, device="cuda", dtype=torch.int32))
+        # Poison captured buffers so missing writes to masked rows or SF padding show up.
+        sf.view(torch.uint8).fill_(255)
+        rows.fill_(float("nan"))
+        graph.replay()
+        sf_physical = sf.permute(5, 2, 4, 0, 1, 3)
+        for e, count in enumerate(counts):
+            assert torch.count_nonzero(rows[e, count:]) == 0
+            if not count:
+                assert torch.count_nonzero(sf_physical[e].view(torch.uint8)) == 0
+                continue
+            qr, sfr, rr = nvfp4_quantize(
+                x[e, :count],
+                scale_inv,
+                per_token_activation=True,
+                backend=reference_backend,
+                **recipe_kwargs,
+            )
+            torch.testing.assert_close(q[:count, :, e], qr, rtol=0, atol=0)
+            torch.testing.assert_close(rows[e, :count], rr, rtol=0, atol=0)
+            padded_rows = sf_physical.shape[1] * 128
+            padded_k = sf_physical.shape[2] * 64
+            physical_sf = unswizzle_sf(sf_physical[e], padded_rows, padded_k)
+            assert torch.count_nonzero(physical_sf[m:]) == 0
+            assert torch.count_nonzero(physical_sf[:, k // 16 :]) == 0
+            actual_sf = physical_sf[:m, : k // 16]
+            expected_sf = unswizzle_sf(sfr.view(torch.float8_e4m3fn), count, k)
+            torch.testing.assert_close(actual_sf[:count], expected_sf, rtol=0, atol=0)
+            assert torch.count_nonzero(actual_sf[count:]) == 0
+
+
+@pytest.mark.parametrize(
+    "grouped,enable_pdl", [(False, False), (False, True), (True, False)]
+)
+@pytest.mark.parametrize("nvfp4_4over6_config", NVFP4_DEFAULT_4OVER6_CONFIGS)
+def test_per_token_nvfp4_disk_reload(
+    grouped, enable_pdl, nvfp4_4over6_config, set_nvfp4_quant_env, tmp_path, monkeypatch
+):
+    """The exported FFI entry must accept the same arguments as a fresh JIT."""
+    if not _is_fp4_supported(torch.device("cuda")):
+        pytest.skip("Requires Blackwell")
+    if not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+    import cutlass.cute as cute
+    from flashinfer.jit import env as jit_env
+    from flashinfer.quantization.kernels import nvfp4_quantize as quant
+
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path)
+    monkeypatch.setenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", "0")
+    set_nvfp4_quant_env(nvfp4_4over6_config=nvfp4_4over6_config)
+    quant._get_compiled_kernel_nvfp4_per_token.cache_clear()
+    x = torch.randn(3, 5, 80, device="cuda", dtype=torch.bfloat16)
+    mask = torch.tensor([5, 3, 0], device="cuda", dtype=torch.int32)
+    scale = torch.tensor([1 / (448 * 6)], device="cuda")
+
+    def run():
+        if grouped:
+            return scaled_fp4_grouped_quantize(
+                x, mask, scale, per_token_activation=True
+            )
+        return quant.nvfp4_quantize_per_token_cute_dsl(
+            x.flatten(0, 1), scale, enable_pdl=enable_pdl
+        )
+
+    expected = run()
+    assert list(tmp_path.rglob("*.o")), "Expected a persisted kernel"
+    quant._get_compiled_kernel_nvfp4_per_token.cache_clear()
+    monkeypatch.setattr(cute, "compile", lambda *a, **kw: pytest.fail("Cache miss"))
+    actual = run()
+    # Packed data in masked rows is intentionally unspecified.
+    for i, (a, b) in enumerate(zip(actual, expected, strict=True)):
+        if grouped and i == 0:
+            a = torch.cat([a[:5, :, 0], a[:3, :, 1]])
+            b = torch.cat([b[:5, :, 0], b[:3, :, 1]])
+        torch.testing.assert_close(
+            a.view(torch.uint8), b.view(torch.uint8), rtol=0, atol=0
+        )
+    quant._get_compiled_kernel_nvfp4_per_token.cache_clear()
