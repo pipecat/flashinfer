@@ -1,0 +1,33 @@
+flashinfer/quantization/kernels/nvfp4_quantize.py
+  s_db6fddc6dc986e::t_fc8445f0241944 1109-1113,1115-1117
+  s_db6fddc6dc986e::t_1e0d394990fc7b 910,922,1090,1120-1122,1131-1133,2415,2468,2474
+  s_db6fddc6dc986e::t_1d0ec8c464a702 1093-1095,1103-1107
+  s_db6fddc6dc986e::t_0164fcd5db46ad 1091-1092,1096-1102,1108,1114,1119,1128-1130,1134-1135
+  s_db6fddc6dc986e::t_e3a8b7da0819db 1118
+flashinfer/quantization/fp4_quantization.py
+  s_db6fddc6dc986e::t_574987b609df19 2507,2510,2527,2540
+benchmarks/bench_grouped_nvfp4_per_token.py
+  s_db6fddc6dc986e::t_375302a969a3a4 114,293,307-308,357-359,365,369-376,382-384
+  s_db6fddc6dc986e::t_30f5f862f7faae 152-160,316,319-320
+  s_db6fddc6dc986e::t_20c94d686465d2 30-32,309-310
+  s_db6fddc6dc986e::t_4f59dfe8c96a02 286-292,294-306,331-338,360-364,366-368,377-380
+  s_db6fddc6dc986e::t_89fb70acd56cb2 317-318
+tests/utils/test_fp4_quantize.py
+  s_db6fddc6dc986e::t_bd2a68902ba593 2870-2872,2889-2894
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "f596946655769ac1ca2d5401c5a0954d94a7ee06",
+  "prompts": {},
+  "sessions": {
+    "s_db6fddc6dc986e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c3e3-5f80-7b00-b927-cd75e6275d7c",
+        "model": "gpt-6.2-astra"
+      },
+      "human_author": "潜雨 <runyuan.zry@antgroup.com>"
+    }
+  }
+}
