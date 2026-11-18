@@ -27,6 +27,9 @@ is selectable. Existing FLASHINFER_NVFP4_* settings are recorded in JSON.
 Per-stage overhead is (grouped_per_token / grouped_non_per_token - 1) * 100.
 The default 5% target is descriptive, not a correctness assertion. The combined
 measurement covers activation quantization plus one GEMM, not a full MoE layer.
+By default, each token picks 8 distinct experts out of 256 with uniform random
+scores. A rank owns the first E experts, with capacity rounded up to 8 rows.
+Use --m for the fixed full/half/empty mask instead.
 
 Example:
     python benchmarks/bench_grouped_nvfp4_per_token.py --output results.json
@@ -108,11 +111,8 @@ def reference_grouped(x, counts, scale_inv, backend):
     )
 
 
-def benchmark_case(args, e, m, k, n):
+def benchmark_case(args, e, counts, m, k, n):
     torch.manual_seed(42)
-    counts = [
-        m if i % 3 == 0 else max(1, m // 2) if i % 3 == 1 else 0 for i in range(e)
-    ]
     mask = torch.tensor(counts, device="cuda", dtype=torch.int32)
     valid = torch.arange(m, device="cuda")[None, :] < mask[:, None]
     x = torch.randn(e, m, k, device="cuda", dtype=getattr(torch, args.dtype))
@@ -147,14 +147,17 @@ def benchmark_case(args, e, m, k, n):
     scale_inv_host = scale_inv.item()
     paths = {
         "grouped_per_token": grouped,
-        "expert_loop_per_token_cuda": lambda: reference_grouped(
-            x, counts, scale_inv_host, "cuda"
-        ),
-        "expert_loop_per_token_cute": lambda: reference_grouped(
-            x, counts, scale_inv, "cute-dsl"
-        ),
         "grouped_non_per_token": non_per_token,
     }
+    if not args.grouped_only:
+        paths.update(
+            expert_loop_per_token_cuda=lambda: reference_grouped(
+                x, counts, scale_inv_host, "cuda"
+            ),
+            expert_loop_per_token_cute=lambda: reference_grouped(
+                x, counts, scale_inv, "cute-dsl"
+            ),
+        )
 
     def time_us(fn):
         fn()
@@ -280,15 +283,41 @@ def benchmark_case(args, e, m, k, n):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--experts", type=int, nargs="+", default=[1, 8])
-    parser.add_argument("--m", type=int, nargs="+", default=[32, 129, 512])
-    parser.add_argument("--k", type=int, nargs="+", default=[4096])
-    parser.add_argument("--n", type=int, default=1024)
+    parser.add_argument(
+        "--experts",
+        type=int,
+        nargs="+",
+        default=[8, 32],
+        help="Number of experts resident on one rank",
+    )
+    routing = parser.add_mutually_exclusive_group()
+    routing.add_argument(
+        "--m",
+        type=int,
+        nargs="+",
+        help="Fixed capacity with repeating full/half/empty experts",
+    )
+    routing.add_argument(
+        "--tokens",
+        type=int,
+        nargs="+",
+        default=[128, 1024],
+        help="Input tokens routed across all experts before EP dispatch",
+    )
+    parser.add_argument("--total-experts", type=int, default=256)
+    parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument("--k", type=int, nargs="+", default=[7168])
+    parser.add_argument("--n", type=int, default=4096)
     parser.add_argument("--dtype", choices=["float16", "bfloat16"], default="bfloat16")
     parser.add_argument(
         "--distribution", choices=["normal", "row-dynamic"], default="row-dynamic"
     )
     parser.add_argument("--quant-only", action="store_true")
+    parser.add_argument(
+        "--grouped-only",
+        action="store_true",
+        help="Compare the two grouped public calls without the per-expert reference loops",
+    )
     parser.add_argument("--cupti", action="store_true")
     parser.add_argument("--repeat", type=int, default=30)
     parser.add_argument(
@@ -299,6 +328,14 @@ def main():
     )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.m is None and not (
+        1 <= args.top_k <= args.total_experts
+        and all(1 <= e <= args.total_experts for e in args.experts)
+        and min(args.tokens) > 0
+    ):
+        parser.error(
+            "routing requires positive token counts and top-k/local experts within total experts"
+        )
     import importlib.metadata
     import flashinfer
 
@@ -317,10 +354,34 @@ def main():
         "cases": [],
     }
     with torch.inference_mode():
-        for e in args.experts:
-            for m in args.m:
+        for size in args.m or args.tokens:
+            if args.m is None:
+                # One reproducible global route; each EP rank owns a slice of experts.
+                scores = torch.rand(
+                    size,
+                    args.total_experts,
+                    generator=torch.Generator().manual_seed(42),
+                )
+                routes = scores.topk(args.top_k, dim=1).indices
+                histogram = (
+                    routes.flatten().bincount(minlength=args.total_experts).tolist()
+                )
+            for e in args.experts:
+                if args.m is None:
+                    counts = histogram[:e]
+                    if not any(counts):
+                        continue
+                    m = (max(counts) + 7) // 8 * 8
+                else:
+                    m = size
+                    counts = [
+                        m if i % 3 == 0 else max(1, m // 2) if i % 3 == 1 else 0
+                        for i in range(e)
+                    ]
                 for k in args.k:
-                    case = benchmark_case(args, e, m, k, args.n)
+                    case = benchmark_case(args, e, counts, m, k, args.n)
+                    case["input_tokens"] = size if args.m is None else None
+                    case["local_routed_rows"] = sum(counts)
                     report["cases"].append(case)
                     args.output.write_text(json.dumps(report, indent=2) + "\n")
                     print(json.dumps(case), flush=True)

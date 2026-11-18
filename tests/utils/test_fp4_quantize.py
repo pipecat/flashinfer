@@ -2867,6 +2867,9 @@ def test_grouped_per_token_nvfp4(
         )
     for counts in ([m, m - 2, 0], [1, 0, 0]):
         mask.copy_(torch.tensor(counts, device="cuda", dtype=torch.int32))
+        # Poison captured buffers so missing writes to masked rows or SF padding show up.
+        sf.view(torch.uint8).fill_(255)
+        rows.fill_(float("nan"))
         graph.replay()
         sf_physical = sf.permute(5, 2, 4, 0, 1, 3)
         for e, count in enumerate(counts):
@@ -2883,7 +2886,12 @@ def test_grouped_per_token_nvfp4(
             )
             torch.testing.assert_close(q[:count, :, e], qr, rtol=0, atol=0)
             torch.testing.assert_close(rows[e, :count], rr, rtol=0, atol=0)
-            actual_sf = unswizzle_sf(sf_physical[e], m, k)
+            padded_rows = sf_physical.shape[1] * 128
+            padded_k = sf_physical.shape[2] * 64
+            physical_sf = unswizzle_sf(sf_physical[e], padded_rows, padded_k)
+            assert torch.count_nonzero(physical_sf[m:]) == 0
+            assert torch.count_nonzero(physical_sf[:, k // 16 :]) == 0
+            actual_sf = physical_sf[:m, : k // 16]
             expected_sf = unswizzle_sf(sfr.view(torch.float8_e4m3fn), count, k)
             torch.testing.assert_close(actual_sf[:count], expected_sf, rtol=0, atol=0)
             assert torch.count_nonzero(actual_sf[count:]) == 0

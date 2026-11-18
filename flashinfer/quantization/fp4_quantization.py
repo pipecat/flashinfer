@@ -2504,14 +2504,11 @@ def scaled_fp4_grouped_quantize(
         scale_inv = scale_inv.reshape(1).contiguous()
         padded_m, padded_k = round_up(m, 128), round_up(k // 16, 4)
         output = torch.empty((b, m, k // 2), dtype=torch.uint8, device=a.device)
-        scales = torch.zeros(
+        scales = torch.empty(
             (b, padded_m * padded_k), dtype=torch.uint8, device=a.device
         )
-        # The shared kernel leaves inactive row scales and SF padding unspecified.
-        row_scales = torch.zeros((b, m), dtype=torch.float32, device=a.device)
+        row_scales = torch.empty((b, m), dtype=torch.float32, device=a.device)
         if b and m:
-            # The shared kernel consumes absolute exclusive limits, not row counts.
-            row_limits = mask + torch.arange(b, dtype=torch.int32, device=a.device) * m
             threads = _per_token_cta_threads(k, b * m)
             num_blocks = min(
                 b * m,
@@ -2527,6 +2524,7 @@ def scaled_fp4_grouped_quantize(
                 threads=threads,
                 rows_per_group=m,
                 sf_rows_per_group=padded_m,
+                grouped_counts=True,
             )
             kernel(
                 a.contiguous().view(b * m, k),
@@ -2539,7 +2537,7 @@ def scaled_fp4_grouped_quantize(
                 scale_inv,
                 num_blocks,
                 None,
-                row_limits,
+                mask,
             )
         sf = scales.view(torch.float8_e4m3fn).view(
             b, padded_m // 128, padded_k // 4, 32, 4, 4
